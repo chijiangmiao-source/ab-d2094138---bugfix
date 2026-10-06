@@ -7,7 +7,14 @@ import {
   MemoryStorage,
   createMemoryBacking,
 } from "../../core/memory-storage.js";
-import { GENESIS_DIGEST } from "../../core/canonical.js";
+import {
+  GENESIS_DIGEST,
+  HASH_FORMAT,
+  LEGACY_HASH_FORMAT,
+  contentHashOf,
+  segmentDigestOf,
+} from "../../core/canonical.js";
+import { FORM_CASES } from "./form-cases.js";
 
 function sha256Node(text) {
   return createHash("sha256").update(text, "utf8").digest("hex");
@@ -189,4 +196,206 @@ export function registerRuleTests(t) {
     });
     t.assertEqual(ok.status, "sealed");
   });
+
+  t.test(
+    "rules: digest covers the actual UTF-8 bytes of form-sensitive payloads",
+    async () => {
+      for (const { name, original, altered } of FORM_CASES) {
+        const engine = await freshEngine();
+        const events = [{ seq: 3, payload: original }];
+        const outcome = await engine.submit({ batchId: "BYTES-1", events });
+        t.assertEqual(outcome.status, "sealed", name);
+        // Independent SHA-256 over the untouched canonical text.
+        const expected = sha256Node(canonicalSegment(GENESIS_DIGEST, events));
+        t.assertEqual(outcome.receipt.digest, expected, name);
+        // The look-alike form is a different identity.
+        const alteredDigest = sha256Node(
+          canonicalSegment(GENESIS_DIGEST, [{ seq: 3, payload: altered }])
+        );
+        t.assert(alteredDigest !== expected, `${name}: forms must hash differently`);
+      }
+    }
+  );
+
+  t.test(
+    "rules: byte-identical retransmission of form-sensitive payloads returns the original receipt",
+    async () => {
+      for (const { name, original } of FORM_CASES) {
+        const engine = await freshEngine();
+        const batch = {
+          batchId: "EXACT-1",
+          events: [{ seq: 1, payload: original }],
+        };
+        const first = await engine.submit(batch);
+        t.assertEqual(first.status, "sealed", name);
+
+        const again = await engine.submit(batch);
+        t.assertEqual(again.status, "duplicate", name);
+        t.assertDeepEqual(again.receipt, first.receipt, name);
+
+        const chain = await engine.sealedChain();
+        t.assertEqual(chain.segments.length, 1, name);
+        t.assertEqual(chain.version, 1, name);
+        t.assertEqual((await engine.conflicts()).length, 0, name);
+      }
+    }
+  );
+
+  t.test(
+    "rules: look-alike payloads with different character forms conflict",
+    async () => {
+      for (const { name, original, altered } of FORM_CASES) {
+        // Both sealing orders must behave identically.
+        for (const [firstPayload, secondPayload] of [
+          [original, altered],
+          [altered, original],
+        ]) {
+          const engine = await freshEngine();
+          const first = await engine.submit({
+            batchId: "FORM-1",
+            events: [{ seq: 1, payload: firstPayload }],
+          });
+          t.assertEqual(first.status, "sealed", name);
+
+          const second = await engine.submit({
+            batchId: "FORM-1",
+            events: [{ seq: 1, payload: secondPayload }],
+          });
+          t.assertEqual(second.status, "conflict", name);
+          t.assertEqual(
+            second.conflict.reason,
+            "published-content-mismatch",
+            name
+          );
+          t.assertDeepEqual(second.conflict.existingReceipt, first.receipt, name);
+          t.assert(
+            second.conflict.incomingContentHash !==
+              second.conflict.existingContentHash,
+            `${name}: conflict must record distinct content hashes`
+          );
+
+          // First evidence is kept: chain untouched, conflict recorded.
+          const chain = await engine.sealedChain();
+          t.assertEqual(chain.segments.length, 1, name);
+          t.assertEqual(chain.segments[0].events[0].payload, firstPayload, name);
+          const conflicts = await engine.conflicts();
+          t.assertEqual(conflicts.length, 1, name);
+          t.assertEqual(conflicts[0].batchId, "FORM-1", name);
+        }
+      }
+    }
+  );
+
+  t.test(
+    "rules: legacy v1 segments stay reviewable, byte differences still conflict",
+    async () => {
+      const backing = createMemoryBacking();
+      const storage = new MemoryStorage(backing);
+
+      // Two segments exactly as the pre-fix rules persisted them: one
+      // tagged review-text-v1, one untagged (predating format tagging).
+      // Payloads use the full-width / combining forms.
+      const legacyEvents1 = [{ seq: 1, payload: "ＡＢＣ" }];
+      const legacyEvents2 = [{ seq: 2, payload: "café" }];
+      const digest1 = await segmentDigestOf(
+        GENESIS_DIGEST,
+        legacyEvents1,
+        LEGACY_HASH_FORMAT
+      );
+      const digest2 = await segmentDigestOf(
+        digest1,
+        legacyEvents2,
+        LEGACY_HASH_FORMAT
+      );
+      await storage.putSegment({
+        digest: digest1,
+        batchId: "LEG-1",
+        hashFormat: LEGACY_HASH_FORMAT,
+        contentHash: await contentHashOf(legacyEvents1, LEGACY_HASH_FORMAT),
+        prevDigest: GENESIS_DIGEST,
+        seqStart: 1,
+        seqEnd: 1,
+        events: legacyEvents1,
+        receipt: {
+          batchId: "LEG-1",
+          digest: digest1,
+          prevDigest: GENESIS_DIGEST,
+          seqStart: 1,
+          seqEnd: 1,
+          count: 1,
+        },
+      });
+      await storage.putSegment({
+        digest: digest2,
+        batchId: "LEG-2",
+        // no hashFormat: untagged legacy record
+        contentHash: await contentHashOf(legacyEvents2, LEGACY_HASH_FORMAT),
+        prevDigest: digest1,
+        seqStart: 2,
+        seqEnd: 2,
+        events: legacyEvents2,
+        receipt: {
+          batchId: "LEG-2",
+          digest: digest2,
+          prevDigest: digest1,
+          seqStart: 2,
+          seqEnd: 2,
+          count: 1,
+        },
+      });
+      await storage.putManifest({
+        id: "active",
+        head: digest2,
+        segmentIds: [digest1, digest2],
+        batches: { "LEG-1": digest1, "LEG-2": digest2 },
+        version: 7,
+      });
+
+      // Reopening must not truncate the legacy chain or report blocking.
+      const engine = new SealEngine(new MemoryStorage(backing));
+      const { recovery, chain } = await engine.open();
+      t.assertEqual(chain.segments.length, 2, "legacy chain must stay sealed");
+      t.assertEqual(recovery.blocking.length, 0, "no blocking evidence");
+      t.assertEqual(chain.version, 7, "manifest untouched by recovery");
+      t.assertEqual(chain.head, digest2);
+
+      // Byte-identical retransmission of a legacy batch: original receipt.
+      const exact = await engine.submit({
+        batchId: "LEG-1",
+        events: [{ seq: 1, payload: "ＡＢＣ" }],
+      });
+      t.assertEqual(exact.status, "duplicate");
+      t.assertEqual(exact.receipt.digest, digest1);
+
+      // A look-alike but byte-different retransmission under a legacy id is
+      // a conflict — the fix must not re-treat different content as the
+      // same receipt just because the old rules would have.
+      const altered = await engine.submit({
+        batchId: "LEG-1",
+        events: [{ seq: 1, payload: "ABC" }],
+      });
+      t.assertEqual(altered.status, "conflict");
+      t.assertEqual(altered.conflict.reason, "published-content-mismatch");
+      t.assertEqual(altered.conflict.existingReceipt.digest, digest1);
+      t.assertEqual((await engine.sealedChain()).segments.length, 2);
+      t.assertEqual((await engine.conflicts()).length, 1);
+
+      // New batches chain onto the legacy head under the current format...
+      const next = await engine.submit({
+        batchId: "LEG-3",
+        events: [{ seq: 3, payload: "new era" }],
+      });
+      t.assertEqual(next.status, "sealed");
+      t.assertEqual(next.receipt.prevDigest, digest2);
+      const stored = backing.segments.get(next.receipt.digest);
+      t.assertEqual(stored.hashFormat, HASH_FORMAT);
+
+      // ...and the mixed-format chain still verifies on the next open.
+      const reopened = new SealEngine(new MemoryStorage(backing));
+      const again = await reopened.open();
+      t.assertEqual(again.chain.segments.length, 3);
+      t.assertEqual(again.recovery.blocking.length, 0);
+      t.assertEqual(again.chain.head, next.receipt.digest);
+    }
+  );
 }

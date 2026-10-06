@@ -9,6 +9,7 @@ import {
   createMemoryBacking,
 } from "../../core/memory-storage.js";
 import { GENESIS_DIGEST, segmentDigestOf } from "../../core/canonical.js";
+import { FORM_CASES } from "./form-cases.js";
 
 function batch(batchId, seqs, payloadPrefix = "event") {
   return {
@@ -312,4 +313,108 @@ export function registerRecoveryTests(t) {
     t.assertEqual(retry.receipt.digest, expectedDigest);
     t.assertEqual((await noCrash.sealedChain()).segments.length, 1);
   });
+
+  t.test(
+    "recovery: pending intent conflicts look-alike retry, fulfills byte-identical retry",
+    async () => {
+      const backing = createMemoryBacking();
+      const { original, altered } = FORM_CASES[0];
+      const submitted = {
+        batchId: "P-9",
+        events: [{ seq: 1, payload: original }],
+      };
+      // Crash after the prepare intent; the same engine session stays open.
+      const engine = new SealEngine(new MemoryStorage(backing), {
+        failpoints: { afterPrepare: true },
+      });
+      await engine.open();
+      try {
+        await engine.submit(submitted);
+        throw new Error("expected crash");
+      } catch (err) {
+        t.assert(err instanceof CrashError, "expected CrashError");
+      }
+
+      // Same-session retry with look-alike but byte-different content:
+      // conflict against the recorded intent, no segment, no manifest.
+      const conflict = await engine.submit({
+        batchId: "P-9",
+        events: [{ seq: 1, payload: altered }],
+      });
+      t.assertEqual(conflict.status, "conflict");
+      t.assertEqual(
+        conflict.conflict.reason,
+        "pending-intent-content-mismatch"
+      );
+      t.assertEqual(backing.segments.size, 0, "no segment written");
+      t.assertEqual(backing.manifest, null, "manifest untouched");
+
+      // Byte-identical retry resumes the recorded intent and seals.
+      const retry = await engine.submit(submitted);
+      t.assertEqual(retry.status, "sealed");
+      t.assertEqual((await engine.sealedChain()).segments.length, 1);
+      t.assertEqual((await engine.conflicts()).length, 1);
+    }
+  );
+
+  t.test(
+    "recovery: afterSegment crash, then form-different and exact retransmission",
+    async () => {      for (const { name, original, altered } of FORM_CASES) {
+        const backing = createMemoryBacking();
+        const submitted = {
+          batchId: "U-1",
+          events: [{ seq: 1, payload: original }],
+        };
+        await crashAt(backing, "afterSegment", submitted);
+
+        // Reopen: recovery publishes the prepared segment as the unique
+        // outcome of the interrupted batch.
+        const { engine, recovery, chain } = await reopen(backing);
+        t.assertEqual(chain.segments.length, 1, name);
+        t.assert(
+          recovery.actions.some(
+            (a) => a.action === "segment-published-from-intent" && a.batchId === "U-1"
+          ),
+          `${name}: expected segment-published-from-intent`
+        );
+        const sealed = chain.segments[0];
+        const recoveryReport = await engine.lastRecovery();
+
+        // Look-alike but byte-different retransmission: conflict, and the
+        // first evidence stays put.
+        const conflict = await engine.submit({
+          batchId: "U-1",
+          events: [{ seq: 1, payload: altered }],
+        });
+        t.assertEqual(conflict.status, "conflict", name);
+        t.assertEqual(
+          conflict.conflict.reason,
+          "published-content-mismatch",
+          name
+        );
+        t.assertEqual(conflict.conflict.existingReceipt.digest, sealed.digest, name);
+
+        // Byte-identical retransmission: the original receipt, nothing more.
+        const exact = await engine.submit(submitted);
+        t.assertEqual(exact.status, "duplicate", name);
+        t.assertDeepEqual(exact.receipt, sealed.receipt, name);
+
+        // No appended segment; sequence range, predecessor and head unchanged.
+        const chainAfter = await engine.sealedChain();
+        t.assertEqual(chainAfter.segments.length, 1, name);
+        t.assertEqual(chainAfter.version, chain.version, name);
+        t.assertEqual(chainAfter.head, chain.head, name);
+        t.assertEqual(chainAfter.segments[0].seqStart, 1, name);
+        t.assertEqual(chainAfter.segments[0].seqEnd, 1, name);
+        t.assertEqual(chainAfter.segments[0].prevDigest, GENESIS_DIGEST, name);
+
+        // Recovery conclusions are not rewritten by retransmissions; the
+        // conflict is the only new evidence.
+        t.assertDeepEqual(await engine.lastRecovery(), recoveryReport, name);
+        const conflicts = await engine.conflicts();
+        t.assertEqual(conflicts.length, 1, name);
+        t.assertEqual(conflicts[0].batchId, "U-1", name);
+      }
+    }
+  );
 }

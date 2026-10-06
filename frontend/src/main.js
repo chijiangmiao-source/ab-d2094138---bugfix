@@ -121,16 +121,17 @@ function parseEvents(text) {
   const events = [];
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i].trim();
-    if (line === "") continue;
+    const line = lines[i];
+    if (line.trim() === "") continue; // 跳过空白行
     const sep = line.indexOf("|");
     if (sep === -1) {
       throw new Error(`第 ${i + 1} 行缺少「|」分隔符（格式：序号|载荷）`);
     }
-    const seq = Number(line.slice(0, sep));
+    const seq = Number(line.slice(0, sep).trim());
     if (!Number.isSafeInteger(seq)) {
       throw new Error(`第 ${i + 1} 行序号不是整数`);
     }
+    // 载荷按实际输入封存：不裁剪、不改写任何字符（含行尾空白）。
     events.push({ seq, payload: line.slice(sep + 1) });
   }
   return events;

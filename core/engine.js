@@ -2,6 +2,8 @@ import {
   GENESIS_DIGEST,
   HASH_FORMAT,
   contentHashOf,
+  isKnownHashFormat,
+  resolveRecordFormat,
   segmentDigestOf,
 } from "./canonical.js";
 import { validateBatch } from "./validate.js";
@@ -22,6 +24,22 @@ export class CrashError extends Error {
 }
 
 const MAX_CONFLICT_LOG = 100;
+
+// Byte identity of two event lists: equal sequence numbers and exactly the
+// same payload characters. Only a byte-identical retransmission is entitled
+// to the original receipt — any difference in the actual UTF-8 content is a
+// conflict, regardless of the hash format the stored record was sealed under.
+function sameEvents(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i].seq !== b[i].seq || a[i].payload !== b[i].payload) {
+      return false;
+    }
+  }
+  return true;
+}
 
 function emptyManifest() {
   return {
@@ -105,11 +123,14 @@ export class SealEngine {
       const existing = await this.#storage.getSegment(
         manifest.batches[batch.batchId]
       );
-      if (existing && existing.contentHash === contentHash) {
-        // Identical retransmission: hand back the original receipt, append nothing.
+      if (existing && sameEvents(existing.events, events)) {
+        // Byte-identical retransmission: hand back the original receipt,
+        // append nothing.
         return { status: "duplicate", receipt: existing.receipt };
       }
-      // Different content under a published id: keep existing evidence, report.
+      // Any payload byte difference under a published id: keep the first
+      // evidence untouched (chain and segments unchanged), report the
+      // conflict.
       const conflict = {
         reason: "published-content-mismatch",
         batchId: batch.batchId,
@@ -125,7 +146,7 @@ export class SealEngine {
     // A pending (unpublished) intent under this batch id?
     const intent = await this.#storage.getPrepare(batch.batchId);
     if (intent) {
-      if (intent.contentHash !== contentHash) {
+      if (!sameEvents(intent.events, events)) {
         const conflict = {
           reason: "pending-intent-content-mismatch",
           batchId: batch.batchId,
@@ -137,7 +158,8 @@ export class SealEngine {
         await this.#recordConflict(conflict);
         return { status: "conflict", conflict };
       }
-      // Same content: resume the established intent, do not start a new one.
+      // Byte-identical to the recorded intent: resume the established
+      // intent, do not start a new one.
       return this.#fulfillIntent(intent, manifest, { persistIntent: false });
     }
 
@@ -199,7 +221,7 @@ export class SealEngine {
     const segment = {
       digest: intent.expectedDigest,
       batchId: intent.batchId,
-      hashFormat: intent.hashFormat ?? HASH_FORMAT,
+      hashFormat: resolveRecordFormat(intent.hashFormat),
       contentHash: intent.contentHash,
       prevDigest: intent.prevDigest,
       seqStart: intent.events[0].seq,
@@ -431,14 +453,29 @@ export class SealEngine {
         detail: `seqStart ${segment.seqStart} does not follow previous seqEnd ${lastSeqEnd}`,
       };
     }
-    const recomputed = await segmentDigestOf(segment.prevDigest, segment.events);
+    // Recompute under the hash format the segment was persisted with.
+    // Segments written before the byte-exact rule stay verifiable under
+    // the legacy format, so the fix never truncates their chain; an
+    // unknown format is blocking evidence, never silently accepted.
+    const hashFormat = resolveRecordFormat(segment.hashFormat);
+    if (!isKnownHashFormat(hashFormat)) {
+      return {
+        code: "segment-hash-format-unknown",
+        detail: `unknown hash format ${JSON.stringify(segment.hashFormat)}`,
+      };
+    }
+    const recomputed = await segmentDigestOf(
+      segment.prevDigest,
+      segment.events,
+      hashFormat
+    );
     if (recomputed !== segment.digest) {
       return {
         code: "segment-digest-mismatch",
         detail: "recomputed digest does not match the stored digest",
       };
     }
-    const contentHash = await contentHashOf(segment.events);
+    const contentHash = await contentHashOf(segment.events, hashFormat);
     if (contentHash !== segment.contentHash) {
       return {
         code: "segment-content-mismatch",
