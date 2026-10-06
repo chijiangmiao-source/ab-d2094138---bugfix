@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 
 import { registerRuleTests } from "./tests/rules.test.js";
 import { registerRecoveryTests } from "./tests/recovery.test.js";
+import { registerIdentityTests } from "./tests/identity.test.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WEB_URL = (process.env.WEB_URL ?? "http://web:8080").replace(/\/$/, "");
@@ -45,6 +46,7 @@ const harness = {
 
 registerRuleTests(harness);
 registerRecoveryTests(harness);
+registerIdentityTests(harness);
 
 const results = [];
 

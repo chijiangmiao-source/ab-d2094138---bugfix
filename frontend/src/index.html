@@ -26,6 +26,7 @@
             <label>
               事件（每行一条：<code>序号|文本载荷</code>，序号严格递增，至多 24 条）
               <textarea id="events-input" rows="6" placeholder="101|姿态机动开始&#10;102|太阳帆板展开确认"></textarea>
+              <small class="hint">载荷按实际 UTF-8 字节封存：全角/半角、组合字符、换行形式、行尾空格均参与身份判定；只有字节完全相同的重传才返回原回执。</small>
             </label>
             <div class="row">
               <button type="submit">提交并封存</button>

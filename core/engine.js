@@ -2,6 +2,7 @@ import {
   GENESIS_DIGEST,
   HASH_FORMAT,
   contentHashOf,
+  isKnownHashFormat,
   segmentDigestOf,
 } from "./canonical.js";
 import { validateBatch } from "./validate.js";
@@ -97,7 +98,10 @@ export class SealEngine {
       return { status: "rejected", error: validation };
     }
     const events = batch.events.map((e) => ({ seq: e.seq, payload: e.payload }));
-    const contentHash = await contentHashOf(events);
+    // Identity is always judged on the literal UTF-8 bytes of the payloads
+    // (current format), even for segments sealed by earlier builds whose
+    // stored contentHash was computed under the lossy legacy format.
+    const contentHash = await contentHashOf(events, HASH_FORMAT);
     const manifest = await this.#loadManifest();
 
     // Already published under this batch id?
@@ -105,16 +109,21 @@ export class SealEngine {
       const existing = await this.#storage.getSegment(
         manifest.batches[batch.batchId]
       );
-      if (existing && existing.contentHash === contentHash) {
-        // Identical retransmission: hand back the original receipt, append nothing.
+      const existingIdentityHash = existing
+        ? await contentHashOf(existing.events, HASH_FORMAT)
+        : null;
+      if (existing && existingIdentityHash === contentHash) {
+        // Byte-identical retransmission: hand back the original receipt,
+        // append nothing.
         return { status: "duplicate", receipt: existing.receipt };
       }
-      // Different content under a published id: keep existing evidence, report.
+      // Different payload bytes under a published id: keep existing
+      // evidence, report.
       const conflict = {
         reason: "published-content-mismatch",
         batchId: batch.batchId,
         incomingContentHash: contentHash,
-        existingContentHash: existing?.contentHash ?? null,
+        existingContentHash: existingIdentityHash,
         existingReceipt: existing?.receipt ?? null,
         at: new Date().toISOString(),
       };
@@ -125,19 +134,20 @@ export class SealEngine {
     // A pending (unpublished) intent under this batch id?
     const intent = await this.#storage.getPrepare(batch.batchId);
     if (intent) {
-      if (intent.contentHash !== contentHash) {
+      const intentIdentityHash = await contentHashOf(intent.events, HASH_FORMAT);
+      if (intentIdentityHash !== contentHash) {
         const conflict = {
           reason: "pending-intent-content-mismatch",
           batchId: batch.batchId,
           incomingContentHash: contentHash,
-          existingContentHash: intent.contentHash,
+          existingContentHash: intentIdentityHash,
           existingReceipt: null,
           at: new Date().toISOString(),
         };
         await this.#recordConflict(conflict);
         return { status: "conflict", conflict };
       }
-      // Same content: resume the established intent, do not start a new one.
+      // Same bytes: resume the established intent, do not start a new one.
       return this.#fulfillIntent(intent, manifest, { persistIntent: false });
     }
 
@@ -159,7 +169,7 @@ export class SealEngine {
       contentHash,
       events,
       prevDigest: manifest.head,
-      expectedDigest: await segmentDigestOf(manifest.head, events),
+      expectedDigest: await segmentDigestOf(manifest.head, events, HASH_FORMAT),
       createdAt: Date.now(),
     };
     return this.#fulfillIntent(newIntent, manifest, { persistIntent: true });
@@ -258,7 +268,8 @@ export class SealEngine {
         segment,
         digest,
         prevDigest,
-        lastSeqEnd
+        lastSeqEnd,
+        segment?.hashFormat ?? HASH_FORMAT
       );
       if (problem) {
         blocking.push({
@@ -379,11 +390,20 @@ export class SealEngine {
   }
 
   // Verify one manifest-linked segment against its expected predecessor.
-  async #verifySegmentLink(segment, digest, expectedPrev, lastSeqEnd) {
+  // Each stored segment is verified under the hash format it was sealed
+  // with, so segments persisted by earlier builds stay reviewable forever.
+  async #verifySegmentLink(segment, digest, expectedPrev, lastSeqEnd, format) {
     if (!segment) {
       return {
         code: "segment-missing",
         detail: `manifest points to missing segment ${digest}`,
+      };
+    }
+    const hashFormat = segment.hashFormat ?? format;
+    if (!isKnownHashFormat(hashFormat)) {
+      return {
+        code: "segment-hash-format-unknown",
+        detail: `segment carries unknown hash format ${String(hashFormat)}`,
       };
     }
     if (segment.digest !== digest) {
@@ -431,14 +451,18 @@ export class SealEngine {
         detail: `seqStart ${segment.seqStart} does not follow previous seqEnd ${lastSeqEnd}`,
       };
     }
-    const recomputed = await segmentDigestOf(segment.prevDigest, segment.events);
+    const recomputed = await segmentDigestOf(
+      segment.prevDigest,
+      segment.events,
+      hashFormat
+    );
     if (recomputed !== segment.digest) {
       return {
         code: "segment-digest-mismatch",
         detail: "recomputed digest does not match the stored digest",
       };
     }
-    const contentHash = await contentHashOf(segment.events);
+    const contentHash = await contentHashOf(segment.events, hashFormat);
     if (contentHash !== segment.contentHash) {
       return {
         code: "segment-content-mismatch",
@@ -474,7 +498,8 @@ export class SealEngine {
       segment,
       intent.expectedDigest,
       intent.prevDigest,
-      lastSeqEnd
+      lastSeqEnd,
+      segment.hashFormat ?? intent.hashFormat ?? HASH_FORMAT
     );
     if (link) return link;
     if (segment.contentHash !== intent.contentHash) {

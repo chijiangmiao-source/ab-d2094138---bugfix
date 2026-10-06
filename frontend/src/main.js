@@ -121,8 +121,11 @@ function parseEvents(text) {
   const events = [];
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i].trim();
-    if (line === "") continue;
+    // Strip only the CR of a CRLF pair (the textarea's line delimiter);
+    // payload bytes — including trailing spaces/tabs — must survive verbatim
+    // because they are part of the sealed identity.
+    const line = lines[i].replace(/\r$/, "");
+    if (line.trim() === "") continue;
     const sep = line.indexOf("|");
     if (sep === -1) {
       throw new Error(`第 ${i + 1} 行缺少「|」分隔符（格式：序号|载荷）`);
